@@ -1,4 +1,5 @@
 import os
+import time
 import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -35,6 +36,7 @@ MODE_FILE = "monitor_mode.txt"
 
 DEEP_LIMIT_PER_CHANNEL = 200
 DAILY_LIMIT_PER_CHANNEL = 20
+TELEGRAM_DELAY_SECONDS = 2
 
 
 def load_seen():
@@ -56,9 +58,7 @@ def is_deep_mode():
         return True
 
     with open(MODE_FILE, "r", encoding="utf-8") as file:
-        mode = file.read().strip()
-
-    return mode != "daily"
+        return file.read().strip() != "daily"
 
 
 def save_daily_mode():
@@ -67,9 +67,7 @@ def save_daily_mode():
 
 
 def get_video_limit():
-    if is_deep_mode():
-        return DEEP_LIMIT_PER_CHANNEL
-    return DAILY_LIMIT_PER_CHANNEL
+    return DEEP_LIMIT_PER_CHANNEL if is_deep_mode() else DAILY_LIMIT_PER_CHANNEL
 
 
 def youtube_get(url, params):
@@ -87,17 +85,25 @@ def youtube_get(url, params):
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-    response = requests.post(
-        url,
-        json={
-            "chat_id": CHAT_ID,
-            "text": text,
-            "disable_web_page_preview": False
-        },
-        timeout=30
-    )
+    while True:
+        response = requests.post(
+            url,
+            json={
+                "chat_id": CHAT_ID,
+                "text": text,
+                "disable_web_page_preview": False
+            },
+            timeout=30
+        )
 
-    response.raise_for_status()
+        if response.status_code == 429:
+            retry_after = response.json().get("parameters", {}).get("retry_after", 10)
+            time.sleep(retry_after + 1)
+            continue
+
+        response.raise_for_status()
+        time.sleep(TELEGRAM_DELAY_SECONDS)
+        break
 
 
 def get_recent_video_ids(channel_id):
