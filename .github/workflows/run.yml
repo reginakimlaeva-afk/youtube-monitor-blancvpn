@@ -1,12 +1,10 @@
-name: YouTube Monitor
+name: Get Channel IDs
 
 on:
-  schedule:
-    - cron: "0 8 * * *"
   workflow_dispatch:
 
 jobs:
-  run-monitor:
+  run-script:
     runs-on: ubuntu-latest
 
     steps:
@@ -24,14 +22,4 @@ jobs:
       - name: Run script
         env:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
-        run: python monitor.py
-
-      - name: Commit seen videos
-        run: |
-          git config --global user.name "github-actions"
-          git config --global user.email "actions@github.com"
-          git add seen_videos.txt || true
-          git commit -m "update seen videos" || true
-          git push
+        run: python get_channel_ids.py
