@@ -1,5 +1,7 @@
 import os
 import requests
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -7,7 +9,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 KEYWORDS = [
     "BlancVPN",
-    "blanc.link"
+    "https://blanc.link/"
 ]
 
 CHANNEL_IDS = [
@@ -29,69 +31,219 @@ CHANNEL_IDS = [
 ]
 
 SEEN_FILE = "seen_videos.txt"
+MODE_FILE = "monitor_mode.txt"
+
+DEEP_LIMIT_PER_CHANNEL = 200
+DAILY_LIMIT_PER_CHANNEL = 20
+
+
+def load_seen():
+    if not os.path.exists(SEEN_FILE):
+        return set()
+
+    with open(SEEN_FILE, "r", encoding="utf-8") as file:
+        return set(line.strip() for line in file if line.strip())
+
+
+def save_seen(seen):
+    with open(SEEN_FILE, "w", encoding="utf-8") as file:
+        for video_id in sorted(seen):
+            file.write(video_id + "\n")
+
+
+def is_deep_mode():
+    if not os.path.exists(MODE_FILE):
+        return True
+
+    with open(MODE_FILE, "r", encoding="utf-8") as file:
+        mode = file.read().strip()
+
+    return mode != "daily"
+
+
+def save_daily_mode():
+    with open(MODE_FILE, "w", encoding="utf-8") as file:
+        file.write("daily")
+
+
+def get_video_limit():
+    if is_deep_mode():
+        return DEEP_LIMIT_PER_CHANNEL
+    return DAILY_LIMIT_PER_CHANNEL
+
+
+def youtube_get(url, params):
+    response = requests.get(url, params=params, timeout=30)
+    response.raise_for_status()
+
+    data = response.json()
+
+    if "error" in data:
+        raise Exception(f"YouTube API error: {data['error']}")
+
+    return data
 
 
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": CHAT_ID, "text": text})
+
+    response = requests.post(
+        url,
+        json={
+            "chat_id": CHAT_ID,
+            "text": text,
+            "disable_web_page_preview": False
+        },
+        timeout=30
+    )
+
+    response.raise_for_status()
 
 
-def get_videos(channel_id):
-    url = "https://www.googleapis.com/youtube/v3/search"
-    params = {
-        "key": YOUTUBE_API_KEY,
-        "channelId": channel_id,
-        "part": "snippet",
-        "order": "date",
-        "maxResults": 5
-    }
-    r = requests.get(url, params=params).json()
-    return r.get("items", [])
+def get_recent_video_ids(channel_id):
+    limit = get_video_limit()
+    video_ids = []
+    page_token = None
+
+    while len(video_ids) < limit:
+        params = {
+            "key": YOUTUBE_API_KEY,
+            "channelId": channel_id,
+            "part": "snippet",
+            "order": "date",
+            "type": "video",
+            "maxResults": 50
+        }
+
+        if page_token:
+            params["pageToken"] = page_token
+
+        data = youtube_get(
+            "https://www.googleapis.com/youtube/v3/search",
+            params
+        )
+
+        for item in data.get("items", []):
+            video_id = item.get("id", {}).get("videoId")
+            if video_id:
+                video_ids.append(video_id)
+
+        page_token = data.get("nextPageToken")
+
+        if not page_token:
+            break
+
+    return video_ids[:limit]
 
 
-def check_keywords(text):
-    text = text.lower()
-    return any(k.lower() in text for k in KEYWORDS)
+def get_video_details(video_ids):
+    videos = []
+
+    for i in range(0, len(video_ids), 50):
+        chunk = video_ids[i:i + 50]
+
+        params = {
+            "key": YOUTUBE_API_KEY,
+            "id": ",".join(chunk),
+            "part": "snippet"
+        }
+
+        data = youtube_get(
+            "https://www.googleapis.com/youtube/v3/videos",
+            params
+        )
+
+        videos.extend(data.get("items", []))
+
+    return videos
 
 
-def load_seen():
-    try:
-        with open(SEEN_FILE, "r") as f:
-            return set(f.read().splitlines())
-    except:
-        return set()
+def description_has_keyword(description):
+    description_lower = description.lower()
+
+    for keyword in KEYWORDS:
+        if keyword.lower() in description_lower:
+            return True
+
+    return False
 
 
-def save_seen(seen):
-    with open(SEEN_FILE, "w") as f:
-        f.write("\n".join(seen))
+def format_date_tbilisi(published_at):
+    dt = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+    tbilisi_dt = dt.astimezone(ZoneInfo("Asia/Tbilisi"))
+    return tbilisi_dt.strftime("%Y-%m-%d %H:%M")
+
+
+def validate_secrets():
+    if not YOUTUBE_API_KEY:
+        raise Exception("Missing YOUTUBE_API_KEY")
+
+    if not TELEGRAM_TOKEN:
+        raise Exception("Missing TELEGRAM_TOKEN")
+
+    if not CHAT_ID:
+        raise Exception("Missing CHAT_ID")
 
 
 def main():
+    validate_secrets()
+
+    deep_mode = is_deep_mode()
+    video_limit = get_video_limit()
+
     seen = load_seen()
     new_seen = set(seen)
 
-    for channel in CHANNEL_IDS:
-        videos = get_videos(channel)
+    found_count = 0
+    sent_count = 0
 
-        for v in videos:
-            vid = v["id"].get("videoId")
-            if not vid:
+    for channel_id in CHANNEL_IDS:
+        video_ids = get_recent_video_ids(channel_id)
+        videos = get_video_details(video_ids)
+
+        for video in videos:
+            video_id = video.get("id")
+
+            if not video_id:
                 continue
 
-            if vid in seen:
+            if video_id in seen:
                 continue
 
-            title = v["snippet"]["title"]
-            desc = v["snippet"]["description"]
+            snippet = video.get("snippet", {})
+            description = snippet.get("description", "")
 
-            if check_keywords(title) or check_keywords(desc):
-                link = f"https://youtube.com/watch?v={vid}"
-                send_telegram(f"{title}\n{link}")
+            if description_has_keyword(description):
+                found_count += 1
 
-            new_seen.add(vid)
+                published_at = format_date_tbilisi(snippet.get("publishedAt", ""))
+                channel_title = snippet.get("channelTitle", "Unknown channel")
+                video_title = snippet.get("title", "Untitled video")
+                video_url = f"https://www.youtube.com/watch?v={video_id}"
+
+                message = (
+                    "Найдено видео с BlancVPN\n\n"
+                    f"Дата: {published_at} Тбилиси\n"
+                    f"Канал: {channel_title}\n"
+                    f"Видео: {video_title}\n"
+                    f"Ссылка: {video_url}"
+                )
+
+                send_telegram(message)
+                sent_count += 1
+
+            new_seen.add(video_id)
 
     save_seen(new_seen)
+
+    if deep_mode:
+        save_daily_mode()
+
+    print(f"Mode before run: {'deep' if deep_mode else 'daily'}")
+    print(f"Videos checked per channel: {video_limit}")
+    print(f"Found new matches: {found_count}")
+    print(f"Sent to Telegram: {sent_count}")
+    print("Mode for next run: daily")
 
 
 if __name__ == "__main__":
