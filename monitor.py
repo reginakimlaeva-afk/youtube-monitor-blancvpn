@@ -1,5 +1,4 @@
 import os
-import time
 import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -36,7 +35,7 @@ MODE_FILE = "monitor_mode.txt"
 
 DEEP_LIMIT_PER_CHANNEL = 200
 DAILY_LIMIT_PER_CHANNEL = 20
-TELEGRAM_DELAY_SECONDS = 2
+MAX_TELEGRAM_MESSAGE_LENGTH = 3500
 
 
 def load_seen():
@@ -85,25 +84,37 @@ def youtube_get(url, params):
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-    while True:
-        response = requests.post(
-            url,
-            json={
-                "chat_id": CHAT_ID,
-                "text": text,
-                "disable_web_page_preview": False
-            },
-            timeout=30
-        )
+    response = requests.post(
+        url,
+        json={
+            "chat_id": CHAT_ID,
+            "text": text,
+            "disable_web_page_preview": False
+        },
+        timeout=30
+    )
 
-        if response.status_code == 429:
-            retry_after = response.json().get("parameters", {}).get("retry_after", 10)
-            time.sleep(retry_after + 1)
-            continue
+    response.raise_for_status()
 
-        response.raise_for_status()
-        time.sleep(TELEGRAM_DELAY_SECONDS)
-        break
+
+def send_telegram_in_chunks(messages):
+    if not messages:
+        return
+
+    header = "Найдены новые видео с BlancVPN:\n\n"
+    current_message = header
+
+    for item in messages:
+        block = item + "\n\n"
+
+        if len(current_message) + len(block) > MAX_TELEGRAM_MESSAGE_LENGTH:
+            send_telegram(current_message.strip())
+            current_message = header + block
+        else:
+            current_message += block
+
+    if current_message.strip() != header.strip():
+        send_telegram(current_message.strip())
 
 
 def get_recent_video_ids(channel_id):
@@ -200,8 +211,7 @@ def main():
     seen = load_seen()
     new_seen = set(seen)
 
-    found_count = 0
-    sent_count = 0
+    found_messages = []
 
     for channel_id in CHANNEL_IDS:
         video_ids = get_recent_video_ids(channel_id)
@@ -220,26 +230,21 @@ def main():
             description = snippet.get("description", "")
 
             if description_has_keyword(description):
-                found_count += 1
-
                 published_at = format_date_tbilisi(snippet.get("publishedAt", ""))
                 channel_title = snippet.get("channelTitle", "Unknown channel")
                 video_title = snippet.get("title", "Untitled video")
                 video_url = f"https://www.youtube.com/watch?v={video_id}"
 
-                message = (
-                    "Найдено видео с BlancVPN\n\n"
+                found_messages.append(
                     f"Дата: {published_at} Тбилиси\n"
                     f"Канал: {channel_title}\n"
                     f"Видео: {video_title}\n"
                     f"Ссылка: {video_url}"
                 )
 
-                send_telegram(message)
-                sent_count += 1
-
             new_seen.add(video_id)
 
+    send_telegram_in_chunks(found_messages)
     save_seen(new_seen)
 
     if deep_mode:
@@ -247,8 +252,7 @@ def main():
 
     print(f"Mode before run: {'deep' if deep_mode else 'daily'}")
     print(f"Videos checked per channel: {video_limit}")
-    print(f"Found new matches: {found_count}")
-    print(f"Sent to Telegram: {sent_count}")
+    print(f"Found new matches: {len(found_messages)}")
     print("Mode for next run: daily")
 
 
